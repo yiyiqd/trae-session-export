@@ -21,7 +21,7 @@ from pathlib import Path
 from flask import Flask, request, jsonify, send_from_directory, send_file
 
 # ---------- 路径配置 ----------
-EXPORT_DIR = Path(r"F:\Ai\Session export\Trae Session export")
+EXPORT_DIR = Path(__file__).resolve().parent / "export"
 EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 DECRYPT_TOOL = Path(__file__).resolve().parent / "decrypt_tool"
