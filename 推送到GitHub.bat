@@ -14,11 +14,20 @@ echo [1/3] 收集本次改动...
 "%GIT%" commit -m "update" >nul 2>&1
 
 echo.
-set /p GH_USER=请输入你的 GitHub 用户名后回车: 
+:input_user
+set GH_USER=
+set /p GH_USER=请输入你的 GitHub 用户名后回车（注意：不是邮箱！不含 @ 那个）: 
 if "%GH_USER%"=="" (
   echo 用户名不能为空
-  pause
-  exit /b
+  goto input_user
+)
+echo %GH_USER% | findstr /C:"@" >nul
+if not errorlevel 1 (
+  echo.
+  echo  你输入的是邮箱。要的是「用户名」：登录 GitHub 后，网页右上角头像旁边
+  echo  下拉里那串字母；或打开你的个人主页，浏览器地址栏 github.com/ 后面那串。
+  echo.
+  goto input_user
 )
 
 "%GIT%" remote remove origin >nul 2>&1
