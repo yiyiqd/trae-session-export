@@ -12,6 +12,9 @@
 - **一键导出所有**：全部会话打包 zip 下载
 - **纯本地运行**：Flask 起在 127.0.0.1，数据不出本机
 
+- <img width="704" height="704" alt="image" src="https://github.com/user-attachments/assets/5670e339-8bc8-40cf-b72b-38d551b13505" />
+
+
 ## 快速开始
 
 ```bash
