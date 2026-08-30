@@ -1,0 +1,3 @@
+# Trae CN Database Decryptor
+# Python 3.10+
+pycryptodome

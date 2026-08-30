@@ -1,0 +1,27 @@
+# ===== 隐私保护（切勿提交）=====
+# 解密后的数据库与密钥
+*.db
+*.db-wal
+*.db-shm
+decrypted_key.json
+database_decrypted.*
+database_traecn_decrypted.*
+data/
+deleted_sessions/
+export/
+export_trae/
+
+# 会话导出产物（个人对话）
+trae_session_*.md
+zcode_session_*.md
+zcode_tools_*.md
+
+# ===== Python =====
+__pycache__/
+*.pyc
+.venv/
+
+# ===== 其他 =====
+*.log
+*.lnk
+.DS_Store

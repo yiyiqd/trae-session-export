@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+
+# Database files
+*.db
+*.db-wal
+*.db-shm
+
+# Key files (sensitive)
+decrypted_key.json
+all_keys.json
+
+# Exported data
+*.json
+!package.json
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
