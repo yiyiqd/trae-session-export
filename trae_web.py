@@ -231,12 +231,18 @@ def _render_trae_tool(name, params):
         body.append(f"删除文件：{params.get('file_paths')}")
     elif name == "TodoWrite":
         for t in params.get("todos") or []:
-            body.append(f"- [{t.get('status', '')}] {t.get('content', '')}")
+            if isinstance(t, dict):
+                body.append(f"- [{t.get('status', '')}] {t.get('content', '')}")
+            else:
+                body.append(f"- {t}")
     elif name == "WebSearch":
         body.append(f"搜索：{params.get('query', '')}")
     elif name == "AskUserQuestion":
         for q in params.get("questions") or []:
-            body.append(f"提问：{q.get('question', '')}")
+            if isinstance(q, dict):
+                body.append(f"提问：{q.get('question', '')}")
+            else:
+                body.append(f"提问：{q}")
     elif name == "finish":
         return ""  # finish.summary 在对话文本里已有，不重复
     else:
@@ -527,7 +533,11 @@ def api_export_all():
             prefix = SOURCES[src]["prefix"]
             for s in sessions:
                 sid = s["id"]
-                md_text, meta = build_chat_md(sid, src)
+                try:
+                    md_text, meta = build_chat_md(sid, src)
+                except Exception as e:
+                    failed.append(f"{sid}: {type(e).__name__}: {e}")
+                    continue
                 if md_text is None:
                     failed.append(f"{sid}: {meta}")
                     continue
@@ -537,6 +547,16 @@ def api_export_all():
     if not any_found:
         msg = "未找到任何会话" + ("；".join(failed) if failed else "")
         return jsonify({"ok": False, "error": msg})
+    if failed:
+        repack = io.BytesIO()
+        # 失败清单并入 zip（原 buf 已关闭，重新打包）
+        buf.seek(0)
+        with zipfile.ZipFile(buf) as zin, zipfile.ZipFile(repack, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                zout.writestr(item, zin.read(item.filename))
+            zout.writestr("_导出失败清单.txt",
+                          "以下会话导出失败（数据异常，不影响其余文件）：\n\n" + "\n".join(failed))
+        buf = repack
     buf.seek(0)
     fname = f"trae_chats_{raw}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
     return send_file(buf, as_attachment=True, download_name=fname, mimetype="application/zip")
