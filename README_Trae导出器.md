@@ -42,8 +42,8 @@ SQLCipher 4（AES-256-CBC、PBKDF2-HMAC-SHA512、256000 迭代），密钥以 `x
 
 ## 输出
 
-- 导出文件保存在 `F:\Ai\Session export\Trae Session export\`，文件名 `trae_session_<标题>_<id前8位>.md`
-- 内容：**完整对话记录**——`## user` / `## assistant` 交替，user 为原始输入，assistant 含中间过程与最终回答
+- 导出文件保存在脚本目录下的 `export\` 文件夹，文件名 `trae_session_<标题>_<id前8位>.md`
+- 内容：**完整对话 + 全部工具调用**——`## user` / `## assistant` 交替；assistant 段含过程说明、🔧 工具调用（**Write/Edit 的完整代码、RunCommand 的命令与输出**）、最终回答，不是只有摘要
 - 一键导出所有：全部会话的对话 MD 打包 zip（数据源选"全部"时两个库一起导）
 
 ## 数据原理
@@ -56,7 +56,9 @@ SQLCipher 4（AES-256-CBC、PBKDF2-HMAC-SHA512、256000 迭代），密钥以 `x
 两版本表结构相同，导出时取：
 - 会话与中文标题：`chat_session`
 - 用户输入：`chat_message_general.content`（干净原文）
-- assistant 回答：`history_v2.messages` 的 raw_messages（role=assistant 的 text 段拼接；缺失时用 task 的 thought/reasoning 兜底）
+- assistant 回答：`server_history_info` 增量流重组（本地 `history_v2` 会被微压缩丢正文）
+- **工具调用（代码来源）**：`chat_message_task` 的 `plan_item.tool_call_info` —— Write/Edit 的文件代码、RunCommand 的命令等
+- 兜底：task summary（每轮最终回答）、history_v2 的 assistant 文本
 
 ## 说明
 

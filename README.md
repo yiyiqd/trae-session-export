@@ -7,6 +7,7 @@
 ## 功能
 
 - **对话记录导出**：user 原始输入 + assistant 完整回答（含中间过程），markdown 原文保真
+- **📦 导出带代码**：assistant 每一步的工具调用全部包含——Write 的完整文件代码、Edit 的旧/新内容、RunCommand 的命令及输出，不是只有对话摘要
 - **双数据源**：Trae Work（TRAE SOLO CN）/ Trae CN，页面一键切换
 - **中文会话标题**：来自解密数据库的 `chat_session.session_title`
 - **一键导出所有**：全部会话打包 zip 下载
@@ -47,7 +48,7 @@ python trae_web.py
 
 1. **密钥提取**：Trae 的会话数据库是 SQLCipher 4 加密（AES-256-CBC / PBKDF2-HMAC-SHA512 / 256000 迭代），密钥首次启动时随机生成、保存在进程内存中。`scan_solo.py` 用 `ReadProcessMemory` 扫描进程内存找到 `x'<64hex>'` 形式的密钥，并用数据库第一页的 HMAC-SHA512 校验正确性。
 2. **页面级解密**：`decrypt_db.py` 逐页 AES 解密（每页 4096 字节，尾部 80 字节 reserve = IV + HMAC），还原出明文 SQLite。
-3. **对话重建**：user 输入取 `chat_message_general`（干净原文），assistant 回答按 `server_history_info` 增量流重组（本地 `history_v2` 会被微压缩丢正文），再拼接每轮的最终回答（`chat_message_task` 的 summary）。
+3. **对话重建**：user 输入取 `chat_message_general`（干净原文），assistant 回答按 `server_history_info` 增量流重组（本地 `history_v2` 会被微压缩丢正文），再拼接每轮的最终回答与**全部工具调用**（`chat_message_task` 的 `plan_item.tool_call_info`：Write/Edit 的文件代码、RunCommand 的命令等，导出带代码不只有摘要）。
 
 ## 致谢
 

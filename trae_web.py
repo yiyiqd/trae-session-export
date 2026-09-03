@@ -157,6 +157,31 @@ def _task_summary(task_raw):
         return ""
 
 
+def _task_tool_blocks(task_raw):
+    """chat_message_task.content -> 该轮全部工具调用的渲染块（Write/Edit 代码、RunCommand 命令等）。"""
+    if not task_raw:
+        return []
+    blocks = []
+    try:
+        data = json.loads(task_raw)
+    except Exception:
+        return []
+    for m in data.get("messages", []):
+        pi = m.get("plan_item") or {}
+        ti = pi.get("tool_call_info") or {}
+        name = ti.get("name") or ""
+        if not name or name in ("finish", "CompactFake"):
+            continue
+        params = ti.get("params") or {}
+        # 跳过空操作（如 old/new 均为空的 Edit）
+        if name == "Edit" and not params.get("old_string") and not params.get("new_string") and not params.get("content"):
+            continue
+        block = _render_trae_tool(name, params)
+        if block:
+            blocks.append(block)
+    return blocks
+
+
 def _assistant_full(history_rows, task_raw):
     """组合 assistant 全文：过程文本（history_v2）+ 最终回答（task summary）"""
     parts = []
@@ -172,9 +197,64 @@ def _assistant_full(history_rows, task_raw):
     return "\n\n".join(parts).strip()
 
 
+def _render_trae_tool(name, params):
+    """把 Trae 一次工具调用渲染成 markdown（input 全保，防超大）。"""
+    params = params or {}
+
+    def code_block(s, lang=""):
+        s = str(s)
+        return f"```{lang}\n{s}\n```"
+
+    lines = [f"🔧 **[{name}]**"]
+    body = []
+    if name == "Write":
+        body.append(f"创建文件：`{params.get('file_path', '')}`")
+        body.append(code_block(params.get("content", "")))
+    elif name == "Edit":
+        body.append(f"编辑文件：`{params.get('file_path', '')}`")
+        if params.get("old_string"):
+            body.append("旧内容：\n" + code_block(params["old_string"]))
+        if params.get("new_string"):
+            body.append("新内容：\n" + code_block(params["new_string"]))
+    elif name in ("RunCommand", "CheckCommandStatus", "StopCommand"):
+        if params.get("command"):
+            body.append(code_block(params["command"], "bash"))
+    elif name == "Read":
+        body.append(f"读取文件：`{params.get('file_path', '')}`")
+    elif name == "Grep":
+        body.append(f"搜索 `{params.get('path', '')}`：{params.get('pattern', '')}")
+    elif name == "LS":
+        body.append(f"列目录：`{params.get('path', '')}`")
+    elif name == "Glob":
+        body.append(f"匹配 `{params.get('path', '')}`：{params.get('pattern', '')}")
+    elif name == "DeleteFile":
+        body.append(f"删除文件：{params.get('file_paths')}")
+    elif name == "TodoWrite":
+        for t in params.get("todos") or []:
+            body.append(f"- [{t.get('status', '')}] {t.get('content', '')}")
+    elif name == "WebSearch":
+        body.append(f"搜索：{params.get('query', '')}")
+    elif name == "AskUserQuestion":
+        for q in params.get("questions") or []:
+            body.append(f"提问：{q.get('question', '')}")
+    elif name == "finish":
+        return ""  # finish.summary 在对话文本里已有，不重复
+    else:
+        try:
+            s = json.dumps(params, ensure_ascii=False)
+        except Exception:
+            s = str(params)
+        if len(s) > 1500:
+            s = s[:1500] + " ...(截断)"
+        body.append(code_block(s, "json"))
+
+    return "\n".join(lines + body).strip()
+
+
 def _server_stream_groups(conn, sid):
     """从 server_history_info 增量流重建：以 user 行为界分组 assistant 文本。
-    返回 [[assistant_text, ...], ...]（每组=一轮的全部 assistant 过程文本）或 None。"""
+    工具调用（Write/Edit/RunCommand 等的代码与命令）在 plan_item 结构的行里一并收集。
+    返回 [[assistant_text, ...], ...] 或 None。"""
     groups = []
     try:
         srows = conn.execute(
@@ -187,30 +267,42 @@ def _server_stream_groups(conn, sid):
         return None
     for (raw,) in srows:
         try:
-            rms = json.loads(raw).get("raw_messages", [])
+            data = json.loads(raw)
         except Exception:
             continue
-        for m in rms:
+        for m in data.get("raw_messages", []):
             role = m.get("role")
             if role == "user":
                 groups.append([])
-            elif role == "assistant":
-                if not groups:
-                    groups.append([])
-                c = m.get("content")
-                texts = []
-                if isinstance(c, list):
-                    for p in c:
-                        if isinstance(p, dict) and p.get("type") == "text":
-                            t = (p.get("text") or "").strip()
-                            if t:
-                                texts.append(t)
-                elif isinstance(c, str) and c.strip():
-                    texts.append(c.strip())
-                for t in texts:
-                    # 去掉相邻重复（同步/多检查点可能重复）
-                    if not groups[-1] or groups[-1][-1] != t:
-                        groups[-1].append(t)
+                continue
+            if role != "assistant":
+                continue
+            if not groups:
+                groups.append([])
+            c = m.get("content")
+            texts = []
+            if isinstance(c, list):
+                for p in c:
+                    if isinstance(p, dict) and p.get("type") == "text":
+                        t = (p.get("text") or "").strip()
+                        if t:
+                            texts.append(t)
+            elif isinstance(c, str) and c.strip():
+                texts.append(c.strip())
+            # 工具调用：raw_messages[].tool_calls[].function_call（name + arguments JSON 串）
+            for tc in (m.get("tool_calls") or []):
+                fc = (tc or {}).get("function_call") or {}
+                name = fc.get("name") or "?"
+                try:
+                    params = json.loads(fc.get("arguments") or "{}")
+                except Exception:
+                    params = {"raw": (fc.get("arguments") or "")[:500]}
+                block = _render_trae_tool(name, params)
+                if block:
+                    texts.append(block)
+            for t in texts:
+                if not groups[-1] or groups[-1][-1] != t:
+                    groups[-1].append(t)
     return groups or None
 
 
@@ -226,13 +318,16 @@ def fetch_conversation(conn, sid):
     ).fetchall()
     asst_mids = [mid for mid, role in rows if role == "assistant"]
 
-    # task summary（每轮最终完整回答）
+    # task：每轮最终回答 summary + 工具调用块（Write/Edit 代码、RunCommand 命令等）
     summaries = []
+    tool_blocks_list = []
     for mid in asst_mids:
         r = conn.execute(
             "SELECT content FROM chat_message_task WHERE message_id=?", (mid,)
         ).fetchone()
-        summaries.append(_task_summary(r[0] if r else ""))
+        raw = r[0] if r else ""
+        summaries.append(_task_summary(raw))
+        tool_blocks_list.append(_task_tool_blocks(raw))
 
     # server 流分组
     groups = _server_stream_groups(conn, sid)
@@ -253,19 +348,21 @@ def fetch_conversation(conn, sid):
             i = asst_i
             asst_i += 1
             if asst_texts is not None:
-                text = asst_texts[i]
+                pieces = [x for x in [asst_texts[i]] + tool_blocks_list[i] if x]
                 s = summaries[i]
-                if s and s not in text:
-                    text = (text + "\n\n" + s).strip() if text else s
+                if s and s not in asst_texts[i]:
+                    pieces.append(s)
+                text = "\n\n".join(pieces).strip()
             else:
                 h_rows = [r[0] for r in conn.execute(
                     "SELECT messages FROM history_v2 WHERE message_id=? AND ifnull(deleted_at,0)=0 ORDER BY id",
                     (mid,),
                 ).fetchall()]
-                text = _assistant_full(h_rows, None)
+                pieces = [x for x in [_assistant_full(h_rows, None)] + tool_blocks_list[i] if x]
                 s = summaries[i]
-                if s and s not in text:
-                    text = (text + "\n\n" + s).strip() if text else s
+                if s and s not in pieces:
+                    pieces.append(s)
+                text = "\n\n".join(pieces).strip()
         turns.append({"role": role, "text": text})
     return turns
 
