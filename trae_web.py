@@ -882,19 +882,20 @@ HTML_PAGE = """<!DOCTYPE html>
     <button id="srcAll" class="src-btn" onclick="switchSource('all')">全部</button>
   </div>
 
-  <label for="sid">Session ID（20 位十六进制，可留空直接从列表点选）</label>
-  <input type="text" id="sid" placeholder="6a70ab366e07f4b94dafacbf" autocomplete="off" onkeydown="if(event.key==='Enter')doExport()">
+  <label for="searchBox">🔍 搜索会话（输入关键词，下方列表即时筛选）</label>
+  <div class="search-row">
+    <input type="text" id="searchBox" placeholder="如：小说 / 回测 / 6a70ab3" autocomplete="off" oninput="renderList()">
+    <span id="searchCount" class="muted"></span>
+  </div>
+
+  <label for="sid" style="margin-top:14px">Session ID（20 位十六进制，可留空直接从列表点选；输入文字会自动转为搜索）</label>
+  <input type="text" id="sid" placeholder="6a70ab366e07f4b94dafacbf" autocomplete="off" oninput="sidMirror()" onkeydown="sidKey(event)">
 
   <div class="btn-row">
     <button id="btnList" onclick="loadSessions()">加载会话列表</button>
     <button id="btnInfo" onclick="queryInfo()">查询会话信息</button>
     <button id="btnExport" onclick="doExport()">导出对话 MD</button>
     <button id="btnAll" onclick="exportAll()">一键导出所有</button>
-  </div>
-
-  <div class="search-row">
-    <input type="text" id="searchBox" placeholder="🔍 关键词过滤会话：标题 / Session ID" autocomplete="off" oninput="renderList()">
-    <span id="searchCount" class="muted"></span>
   </div>
 
   <div id="sessionList" class="list" style="display:none"></div>
@@ -971,6 +972,24 @@ function renderList() {
     }).join('');
   }
   cnt.textContent = kw ? ('匹配 ' + arr.length + ' / 共 ' + loadedSessions.length) : ('共 ' + loadedSessions.length);
+}
+
+function looksLikeId(v) {
+  v = (v || '').trim().toLowerCase().replace(/^sess_/, '');
+  return /^[0-9a-f][0-9a-f-]{5,}$/.test(v);
+}
+function sidMirror() {
+  var v = $sid.value.trim();
+  if (!v || looksLikeId(v)) { return; }
+  document.getElementById('searchBox').value = v;
+  $sid.value = '';
+  renderList();
+}
+function sidKey(e) {
+  if (e.key !== 'Enter') { return; }
+  var v = $sid.value.trim();
+  if (v && !looksLikeId(v)) { sidMirror(); return; }
+  if (v) { doExport(); }
 }
 
 async function deleteSession(id, src, ev) {
