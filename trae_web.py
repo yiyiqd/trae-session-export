@@ -13,12 +13,18 @@ import os
 import re
 import io
 import json
+import shutil
 import sqlite3
 import zipfile
 from datetime import datetime
 from pathlib import Path
 
 from flask import Flask, request, jsonify, send_from_directory, send_file
+
+try:
+    import sqlcipher3  # 写实时加密库用（pip install sqlcipher3）
+except Exception:
+    sqlcipher3 = None
 
 # ---------- 路径配置 ----------
 EXPORT_DIR = Path(__file__).resolve().parent / "export"
@@ -41,6 +47,23 @@ SOURCES = {
 SESSION_ID_RE = re.compile(r"^[0-9a-f]{20,24}$")
 
 app = Flask(__name__)
+
+# ---------- 实时加密库（删除功能用） ----------
+BASE_DIR = Path(__file__).resolve().parent
+BACKUP_DIR = BASE_DIR / "backup"
+DELETED_DIR = BASE_DIR / "deleted_sessions"
+KEY_FILE = DECRYPT_TOOL / "decrypted_key.json"
+_APPDATA = Path(os.environ.get("APPDATA", ""))
+SOURCES["solo"].update({
+    "live_db": _APPDATA / "TRAE SOLO CN" / "ModularData" / "ai-agent" / "database.db",
+    "snapshot_root": _APPDATA / "TRAE SOLO CN" / "ModularData" / "ai-agent" / "snapshot",
+})
+SOURCES["cn"].update({
+    "live_db": _APPDATA / "Trae CN" / "ModularData" / "ai-agent" / "database.db",
+    "snapshot_root": _APPDATA / "Trae CN" / "ModularData" / "ai-agent" / "snapshot",
+})
+# 全局按会话 ID 命名的附加目录（Trae CN 的 worktrees / mcps）
+_EXTRA_ROOTS = [Path.home() / ".trae-cn" / "worktrees", Path.home() / ".trae-cn" / "mcps"]
 
 
 def format_ts(ts):
@@ -567,6 +590,234 @@ def download(filename):
     return send_from_directory(str(EXPORT_DIR), filename, as_attachment=True)
 
 
+# ---------- 删除会话（写实时加密库，彻底删除） ----------
+def _load_key():
+    """读取内存扫描导出的 SQLCipher 密钥（64 位十六进制）。"""
+    if not KEY_FILE.exists():
+        return None
+    try:
+        k = json.loads(KEY_FILE.read_text(encoding="utf-8")).get("enc_key") or ""
+        return k if re.fullmatch(r"[0-9a-fA-F]{64}", k) else None
+    except Exception:
+        return None
+
+
+def open_live_db(source, readonly=True):
+    """用密钥打开实时加密库（SQLCipher）。失败抛 RuntimeError，先备份/写入前用它预检。"""
+    if sqlcipher3 is None:
+        raise RuntimeError("未安装 sqlcipher3（pip install sqlcipher3），无法访问实时加密库")
+    key = _load_key()
+    if not key:
+        raise RuntimeError("密钥不可用：请先双击 decrypt_tool\\刷新密钥并解密.bat（需 Trae 正在运行）")
+    live = SOURCES[source]["live_db"]
+    if not live.exists():
+        raise RuntimeError(f"实时加密库不存在：{live}")
+    if readonly:
+        conn = sqlcipher3.connect(f"file:{live.as_posix()}?mode=ro", uri=True, timeout=15)
+    else:
+        conn = sqlcipher3.connect(str(live), timeout=15)
+    try:
+        conn.execute(f"PRAGMA key = \"x'{key}'\"")
+        conn.execute("SELECT count(*) FROM sqlite_master").fetchone()  # 密钥错误会在这里报错
+    except Exception:
+        conn.close()
+        raise RuntimeError("实时库密钥验证失败（Trae 重启过导致密钥变化？）："
+                           "请先双击 decrypt_tool\\刷新密钥并解密.bat（需 Trae 正在运行）")
+    return conn
+
+
+def _session_tables(conn):
+    """把库里的表分成两组。返回 (带 session_id 列的表, 仅带 message_id 列的表)。"""
+    tables_with_sid, tables_with_mid_only = [], []
+    for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type='table'"):
+        if name.startswith("sqlite_"):
+            continue
+        cols = [r[1] for r in conn.execute(f'PRAGMA table_info("{name}")')]
+        if "session_id" in cols:
+            tables_with_sid.append(name)
+        elif "message_id" in cols:
+            tables_with_mid_only.append(name)
+    return tables_with_sid, tables_with_mid_only
+
+
+def _iter_deletes(conn, sid, tables_with_sid, tables_with_mid_only, count_only=False):
+    """生成删除（或统计）语句。顺序敏感：先删仅 message_id 的表（其条件引用 chat_message），
+    再删带 session_id 的表（含 chat_message 本身）。yield (表名, 影响行数或异常)。"""
+    plans = [(t, f'SELECT count(*) FROM "{t}" WHERE message_id IN '
+                 f'(SELECT message_id FROM chat_message WHERE session_id=?)') for t in tables_with_mid_only]
+    plans += [(t, f'SELECT count(*) FROM "{t}" WHERE session_id=?') for t in tables_with_sid]
+    for t, sql in plans:
+        try:
+            if count_only:
+                yield t, conn.execute(sql, (sid,)).fetchone()[0]
+            else:
+                cur = conn.execute(sql.replace("SELECT count(*) FROM", "DELETE FROM"), (sid,))
+                yield t, max(cur.rowcount, 0)
+        except Exception as e:
+            yield t, f"跳过({type(e).__name__}: {e})"
+
+
+def _count_rows(conn, sid, tables_with_sid, tables_with_mid_only):
+    return dict(_iter_deletes(conn, sid, tables_with_sid, tables_with_mid_only, count_only=True))
+
+
+def _delete_rows(conn, sid, tables_with_sid, tables_with_mid_only):
+    return dict(_iter_deletes(conn, sid, tables_with_sid, tables_with_mid_only, count_only=False))
+
+
+def _collect_session_files(source, sid):
+    """该会话在磁盘上的文件/目录：snapshot git 目录 + 全局附加目录里的同名子目录。"""
+    out = []
+    snap = SOURCES[source]["snapshot_root"] / sid
+    if snap.exists():
+        out.append(snap)
+    for root in _EXTRA_ROOTS:
+        if not root.exists():
+            continue
+        for child in root.iterdir():
+            if sid in child.name:
+                out.append(child)
+    return out
+
+
+def _check_session_exists(source, sid):
+    conn = open_db(source)
+    if conn is None:
+        return None, "未找到解密数据库（decrypt_tool 下），请先双击 decrypt_tool\\刷新密钥并解密.bat"
+    try:
+        row = conn.execute("SELECT session_title FROM chat_session WHERE session_id=?", (sid,)).fetchone()
+        if not row:
+            return None, "会话不在当前数据源中（可能已删除）"
+        return (row[0] or "").strip(), None
+    finally:
+        conn.close()
+
+
+@app.post("/api/delete/info")
+def api_delete_info():
+    """删除预览：会话标题、各表行数、磁盘文件、实时库可用性。只读，不删任何东西。"""
+    data = request.get_json(silent=True) or {}
+    source = get_source()
+    sid = (data.get("session_id") or "").strip().lower()
+    if not SESSION_ID_RE.match(sid):
+        return jsonify({"ok": False, "error": "Session ID 格式不正确（20 位十六进制）"})
+    title, err = _check_session_exists(source, sid)
+    if err:
+        return jsonify({"ok": False, "error": err})
+    conn = open_db(source)
+    try:
+        t_with_sid, t_mid_only = _session_tables(conn)
+    finally:
+        conn.close()
+    tables = _count_rows(open_db(source), sid, t_with_sid, t_mid_only)
+    files = [{"path": str(p), "size_mb": round(sum(f.stat().st_size for f in p.rglob("*") if f.is_file()) / 1048576, 1)}
+             for p in _collect_session_files(source, sid)]
+    live_ok, live_err = True, ""
+    try:
+        pre = open_live_db(source, readonly=True)
+        pre.close()
+    except Exception as e:
+        live_ok, live_err = False, str(e)
+    return jsonify({
+        "ok": True, "session_id": sid, "source": SOURCES[source]["label"], "title": title,
+        "tables": tables, "files": files,
+        "live_ok": live_ok, "live_err": live_err,
+        "note": "删除=整库备份 → 写实时加密库删行 → 同步删解密库 → 会话文件移入 deleted_sessions（可恢复）",
+    })
+
+
+@app.post("/api/delete")
+def api_delete():
+    """彻底删除：备份实时库 → SQLCipher 写实时库删行 → 同步删解密库 → 会话文件移入回收站目录。"""
+    data = request.get_json(silent=True) or {}
+    source = get_source()
+    sid = (data.get("session_id") or "").strip().lower()
+    if not SESSION_ID_RE.match(sid):
+        return jsonify({"ok": False, "error": "Session ID 格式不正确（20 位十六进制）"})
+    title, err = _check_session_exists(source, sid)
+    if err:
+        return jsonify({"ok": False, "error": err})
+
+    # 0. 预检实时库可写（密钥新鲜度），失败则中止（不产生半套备份）
+    try:
+        pre = open_live_db(source, readonly=True)
+        pre.close()
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"实时库无法访问，已中止：{e}"})
+
+    # 1. 整库备份（含 wal/shm）
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    live = SOURCES[source]["live_db"]
+    backup_paths = []
+    try:
+        for suffix in ("", "-wal", "-shm"):
+            f = Path(str(live) + suffix)
+            if f.exists():
+                dst = BACKUP_DIR / f"trae_{source}_before_delete_{stamp}{suffix}.db.bak"
+                shutil.copy2(f, dst)
+                backup_paths.append(str(dst))
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"备份失败，已中止删除：{e}"}), 500
+
+    # 2. 写实时加密库
+    live = SOURCES[source]["live_db"]
+    try:
+        conn = open_live_db(source, readonly=False)
+        try:
+            t_with_sid, t_mid_only = _session_tables(conn)
+            deleted_rows = _delete_rows(conn, sid, t_with_sid, t_mid_only)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        return jsonify({"ok": False,
+                        "error": f"实时库写入失败（可能 Trae 正占用）：{e}。整库备份已生成：{backup_paths[0]}，"
+                                 f"可关闭 Trae 后重试"}), 500
+
+    # 3. 同步删解密库（列表立即消失；下次刷新解密也不会复活，因为实时库已删）
+    decrypted_note = "已同步"
+    try:
+        dconn = open_db(source)
+        if dconn is not None:
+            try:
+                t_with_sid, t_mid_only = _session_tables(dconn)
+                _delete_rows(dconn, sid, t_with_sid, t_mid_only)
+                dconn.commit()
+            finally:
+                dconn.close()
+        else:
+            decrypted_note = "解密库不存在，跳过"
+    except Exception as e:
+        decrypted_note = f"解密库同步失败（不影响实时库）：{type(e).__name__}"
+
+    # 4. 会话文件移入回收站目录（可恢复）
+    moved, dest_path = [], None
+    paths = _collect_session_files(source, sid)
+    if paths:
+        dest_path = DELETED_DIR / f"{sid}_{stamp}"
+        for p in paths:
+            try:
+                dest = dest_path / p.name
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(p), str(dest))
+                moved.append(str(p))
+            except Exception as e:
+                moved.append(f"{p} (移动失败: {type(e).__name__})")
+
+    return jsonify({
+        "ok": True, "session_id": sid, "title": title,
+        "source": SOURCES[source]["label"],
+        "deleted_rows": deleted_rows,
+        "decrypted": decrypted_note,
+        "moved_files": len([m for m in moved if "移动失败" not in m]),
+        "moved_detail": moved,
+        "backup": backup_paths,
+        "trash_dir": str(dest_path) if dest_path else "",
+        "hint": "若 Trae 正在运行，其界面列表可能要重启 Trae 后才消失",
+    })
+
+
 # ---------- 前端页面 ----------
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -604,9 +855,11 @@ HTML_PAGE = """<!DOCTYPE html>
   .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; }
   .kv b { color: #8b93a7; font-weight: 500; }
   .list { margin-top: 8px; max-height: 300px; overflow-y: auto; border: 1px solid #2f3446; border-radius: 8px; }
-  .list-item { padding: 8px 12px; border-bottom: 1px solid #232838; cursor: pointer; font-size: 12px; display: flex; justify-content: space-between; gap: 8px; align-items: center; }
-  .list-item:hover { background: #232838; }
-  .list-item code { color: #7ea6ff; }
+.list-item { padding: 8px 12px; border-bottom: 1px solid #232838; cursor: pointer; font-size: 12px; display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+.list-item:hover { background: #232838; }
+.list-item code { color: #7ea6ff; }
+.del-btn { background: #c0392b; color: #fff; border: none; border-radius: 6px; padding: 3px 12px; font-size: 12px; cursor: pointer; flex-shrink: 0; }
+.del-btn:hover { background: #e74c3c; }
   .li-left { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
   .li-name { color: #e6e6e6; font-size: 13px; font-weight: 600; }
   .muted { color: #5d6577; }
@@ -682,6 +935,35 @@ function switchSource(s) {
 
 function pickSession(id) { $sid.value = id; $list.style.display = 'none'; }
 
+async function deleteSession(id, src, ev) {
+  if (ev) { ev.stopPropagation(); }
+  const srcName = src === 'cn' ? 'Trae CN' : 'Trae Work（SOLO）';
+  if (!confirm('彻底删除会话 ' + id + '？\\n\\n数据源：' + srcName +
+      '\\n将写入 Trae 实时加密库删除该会话全部数据，并移除会话文件。\\n删除前自动整库备份（约几百MB，需要几秒到几十秒）。')) return;
+  setBusy(true); show('info', '正在删除（先整库备份，请稍候）…');
+  try {
+    const d = await post('/api/delete', { session_id: id, source: src });
+    if (!d.ok) { show('error', esc(d.error)); return; }
+    const rows = d.deleted_rows || {};
+    let total = 0;
+    for (const k in rows) { if (typeof rows[k] === 'number') total += rows[k]; }
+    let tbl = Object.keys(rows).filter(function (k) { return rows[k] > 0; })
+      .map(function (k) { return '<b>' + esc(k) + '</b><span>' + rows[k] + ' 行</span>'; }).join('');
+    show('success',
+      '<div class="kv">' +
+      '<b>已删除</b><span>' + esc(d.title) + '（' + esc(d.source) + '）</span>' +
+      '<b>清理行数</b><span>共 ' + total + ' 行</span>' +
+      (d.moved_files ? '<b>移除文件</b><span>' + d.moved_files + ' 项 → deleted_sessions</span>' : '') +
+      '<b>整库备份</b><span>' + esc(d.backup[0] || '') + '</span>' +
+      '</div>' +
+      (tbl ? '<details style="margin-top:10px"><summary style="cursor:pointer">各表明细</summary><div class="kv" style="margin-top:6px">' + tbl + '</div></details>' : '') +
+      '<p style="margin-top:10px;color:#8b93a7">' + esc(d.hint || '') + '</p>'
+    );
+    loadSessions();
+  } catch (e) { show('error', '请求失败：' + esc(e.message)); }
+  finally { setBusy(false); }
+}
+
 async function loadSessions() {
   setBusy(true);
   try {
@@ -696,7 +978,10 @@ async function loadSessions() {
         (s.title ? '<span class="li-name">' + esc(s.title) + '</span>' : '') +
         '<code>' + esc(s.id) + '</code>' +
         '</span>' +
+        '<span style="display:flex;align-items:center;gap:10px;flex-shrink:0">' +
         '<span class="muted">' + s.turns + ' 轮 · ' + esc(s.updated || s.created || '?') + '</span>' +
+        '<button class="del-btn" onclick="deleteSession(&quot;' + esc(s.id) + '&quot;,&quot;' + curSource + '&quot;,event)">删</button>' +
+        '</span>' +
         '</div>';
     }).join('');
     show('info', '共 ' + d.sessions.length + ' 个会话，点击列表项填入 ID');

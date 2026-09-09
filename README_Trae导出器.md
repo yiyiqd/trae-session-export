@@ -25,6 +25,13 @@ python trae_web.py
 **批量导出**
 - **一键导出所有** —— 把当前数据源全部会话的 MD（文件名带中文标题）打包成 zip 下载；数据源选"全部"时一起导出
 
+**彻底删除会话**
+- 会话列表每项右侧红色 **删** 按钮：二次确认后**写入 Trae 实时加密库**删除该会话全部数据（Trae 客户端里也不再显示），同时同步清理解密库、移除 snapshot 会话目录
+- 删除前自动整库备份到 `backup\`（含 wal/shm，约几百 MB），会话文件移入 `deleted_sessions\`（可恢复）
+- 依赖：`pip install sqlcipher3`（Windows 有现成轮子）；密钥复用 `decrypt_tool\decrypted_key.json`
+- 密钥过期（Trae 重启过）会拒绝删除并提示先跑 `decrypt_tool\刷新密钥并解密.bat`
+- 若 Trae 正在运行，删除成功后 Trae 界面列表可能要重启 Trae 才消失
+
 ## 获取中文标题（解密数据库，可选）
 
 中文标题和完整对话存在加密的 `database.db` 里。要显示中文标题，需先解密一次：
@@ -42,8 +49,8 @@ SQLCipher 4（AES-256-CBC、PBKDF2-HMAC-SHA512、256000 迭代），密钥以 `x
 
 ## 输出
 
-- 导出文件保存在脚本目录下的 `export\` 文件夹，文件名 `trae_session_<标题>_<id前8位>.md`
-- 内容：**完整对话 + 全部工具调用**——`## user` / `## assistant` 交替；assistant 段含过程说明、🔧 工具调用（**Write/Edit 的完整代码、RunCommand 的命令与输出**）、最终回答，不是只有摘要
+- 导出文件保存在 `F:\Ai\Session export\Trae Session export\`，文件名 `trae_session_<标题>_<id前8位>.md`
+- 内容：**完整对话记录**——`## user` / `## assistant` 交替，user 为原始输入，assistant 含中间过程与最终回答
 - 一键导出所有：全部会话的对话 MD 打包 zip（数据源选"全部"时两个库一起导）
 
 ## 数据原理
@@ -56,9 +63,7 @@ SQLCipher 4（AES-256-CBC、PBKDF2-HMAC-SHA512、256000 迭代），密钥以 `x
 两版本表结构相同，导出时取：
 - 会话与中文标题：`chat_session`
 - 用户输入：`chat_message_general.content`（干净原文）
-- assistant 回答：`server_history_info` 增量流重组（本地 `history_v2` 会被微压缩丢正文）
-- **工具调用（代码来源）**：`chat_message_task` 的 `plan_item.tool_call_info` —— Write/Edit 的文件代码、RunCommand 的命令等
-- 兜底：task summary（每轮最终回答）、history_v2 的 assistant 文本
+- assistant 回答：`history_v2.messages` 的 raw_messages（role=assistant 的 text 段拼接；缺失时用 task 的 thought/reasoning 兜底）
 
 ## 说明
 
