@@ -860,6 +860,9 @@ HTML_PAGE = """<!DOCTYPE html>
 .list-item code { color: #7ea6ff; }
 .del-btn { background: #c0392b; color: #fff; border: none; border-radius: 6px; padding: 3px 12px; font-size: 12px; cursor: pointer; flex-shrink: 0; }
 .del-btn:hover { background: #e74c3c; }
+.search-row { display: flex; gap: 10px; align-items: center; margin-top: 12px; }
+.search-row input[type=text] { flex: 1; width: auto; }
+#searchCount { flex-shrink: 0; }
   .li-left { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
   .li-name { color: #e6e6e6; font-size: 13px; font-weight: 600; }
   .muted { color: #5d6577; }
@@ -887,6 +890,11 @@ HTML_PAGE = """<!DOCTYPE html>
     <button id="btnInfo" onclick="queryInfo()">查询会话信息</button>
     <button id="btnExport" onclick="doExport()">导出对话 MD</button>
     <button id="btnAll" onclick="exportAll()">一键导出所有</button>
+  </div>
+
+  <div class="search-row">
+    <input type="text" id="searchBox" placeholder="🔍 关键词过滤会话：标题 / Session ID" autocomplete="off" oninput="renderList()">
+    <span id="searchCount" class="muted"></span>
   </div>
 
   <div id="sessionList" class="list" style="display:none"></div>
@@ -931,9 +939,39 @@ function switchSource(s) {
   var map = { solo: 'srcSolo', cn: 'srcCn', all: 'srcAll' };
   document.getElementById(map[s]).classList.add('active');
   $list.style.display = 'none';
+  document.getElementById('searchCount').textContent = '';
 }
 
 function pickSession(id) { $sid.value = id; $list.style.display = 'none'; }
+
+var loadedSessions = [];
+function renderList() {
+  var kw = document.getElementById('searchBox').value.trim().toLowerCase();
+  var cnt = document.getElementById('searchCount');
+  if (!loadedSessions.length) { if (kw) { cnt.textContent = ''; } return; }
+  var arr = loadedSessions.filter(function (s) {
+    if (!kw) { return true; }
+    return ((s.title || '') + ' ' + s.id).toLowerCase().indexOf(kw) >= 0;
+  });
+  $list.style.display = 'block';
+  if (!arr.length) {
+    $list.innerHTML = '<div class="list-item" style="cursor:default;color:#8b93a7">无匹配会话</div>';
+  } else {
+    $list.innerHTML = arr.map(function (s) {
+      return '<div class="list-item" onclick="pickSession(&quot;' + esc(s.id) + '&quot;)">' +
+        '<span class="li-left">' +
+        (s.title ? '<span class="li-name">' + esc(s.title) + '</span>' : '') +
+        '<code>' + esc(s.id) + '</code>' +
+        '</span>' +
+        '<span style="display:flex;align-items:center;gap:10px;flex-shrink:0">' +
+        '<span class="muted">' + s.turns + ' 轮 · ' + esc(s.updated || s.created || '?') + '</span>' +
+        '<button class="del-btn" onclick="deleteSession(&quot;' + esc(s.id) + '&quot;,&quot;' + curSource + '&quot;,event)">删</button>' +
+        '</span>' +
+        '</div>';
+    }).join('');
+  }
+  cnt.textContent = kw ? ('匹配 ' + arr.length + ' / 共 ' + loadedSessions.length) : ('共 ' + loadedSessions.length);
+}
 
 async function deleteSession(id, src, ev) {
   if (ev) { ev.stopPropagation(); }
@@ -971,20 +1009,9 @@ async function loadSessions() {
     const d = await r.json();
     if (!d.ok) { show('error', esc(d.error)); return; }
     if (!d.sessions.length) { show('info', '当前数据源没有任何会话'); return; }
-    $list.style.display = 'block';
-    $list.innerHTML = d.sessions.map(function (s) {
-      return '<div class="list-item" onclick="pickSession(&quot;' + esc(s.id) + '&quot;)">' +
-        '<span class="li-left">' +
-        (s.title ? '<span class="li-name">' + esc(s.title) + '</span>' : '') +
-        '<code>' + esc(s.id) + '</code>' +
-        '</span>' +
-        '<span style="display:flex;align-items:center;gap:10px;flex-shrink:0">' +
-        '<span class="muted">' + s.turns + ' 轮 · ' + esc(s.updated || s.created || '?') + '</span>' +
-        '<button class="del-btn" onclick="deleteSession(&quot;' + esc(s.id) + '&quot;,&quot;' + curSource + '&quot;,event)">删</button>' +
-        '</span>' +
-        '</div>';
-    }).join('');
-    show('info', '共 ' + d.sessions.length + ' 个会话，点击列表项填入 ID');
+    loadedSessions = d.sessions;
+    renderList();
+    show('info', '共 ' + d.sessions.length + ' 个会话，点击列表项填入 ID；搜索框可按标题/ID 过滤');
   } catch (e) { show('error', '请求失败：' + esc(e.message)); }
   finally { setBusy(false); }
 }
