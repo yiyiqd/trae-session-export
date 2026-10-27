@@ -37,7 +37,7 @@ python trae_web.py
 ├─ trae_gitlib.py         纯 Python git 对象解析库（无 git 依赖）
 ├─ 启动Trae导出器.bat
 └─ decrypt_tool/          数据库解密工具链
-   ├─ scan_solo.py        进程内存扫描提取 SQLCipher 密钥（适配 TRAE SOLO CN）
+   ├─ scan_solo.py        进程内存扫描提取 SQLCipher 密钥（适配 TRAE SOLO CN / Trae CN）
    ├─ scan_memory.py      内存扫描原版
    ├─ decrypt_db.py       页面级 AES-256-CBC 解密
    ├─ 刷新密钥并解密.bat    一键：扫密钥 → 解密两个库
@@ -46,7 +46,7 @@ python trae_web.py
 
 ## 工作原理
 
-1. **密钥提取**：Trae 的会话数据库是 SQLCipher 4 加密（AES-256-CBC / PBKDF2-HMAC-SHA512 / 256000 迭代），密钥首次启动时随机生成、保存在进程内存中。`scan_solo.py` 用 `ReadProcessMemory` 扫描进程内存找到 `x'<64hex>'` 形式的密钥，并用数据库第一页的 HMAC-SHA512 校验正确性。
+1. **密钥提取**：Trae 的会话数据库是 SQLCipher 4 加密（AES-256-CBC / PBKDF2-HMAC-SHA512 / 256000 迭代），密钥首次启动时随机生成、保存在进程内存中。`scan_solo.py` 用 `ReadProcessMemory` 扫描进程内存找到 `x'<64hex>'` 形式的密钥，并用数据库第一页的 HMAC-SHA512 校验正确性。新版 Trae（2026-10 起）的进程已不再加载 `ai_agent.dll`，扫描器改为遍历目标进程的全部实例（加载过 `sqlite3.node` 的优先），逐个扫描直到校验通过，因此提取可能需要几分钟。
 2. **页面级解密**：`decrypt_db.py` 逐页 AES 解密（每页 4096 字节，尾部 80 字节 reserve = IV + HMAC），还原出明文 SQLite。
 3. **对话重建**：user 输入取 `chat_message_general`（干净原文），assistant 回答按 `server_history_info` 增量流重组（本地 `history_v2` 会被微压缩丢正文），再拼接每轮的最终回答与**全部工具调用**（`chat_message_task` 的 `plan_item.tool_call_info`：Write/Edit 的文件代码、RunCommand 的命令等，导出带代码不只有摘要）。
 

@@ -3,7 +3,8 @@ Scan Trae CN process memory for SQLCipher encryption key.
 Inspired by wechat-decrypt: https://github.com/ylytdeng/wechat-decrypt
 
 Uses Windows API directly (no Frida) to:
-1. Find ai_agent.dll process
+1. Collect candidate Trae processes (新版 Trae 已不再加载 ai_agent.dll，
+   无法按模块过滤，因此把目标进程名的全部实例都作为候选)
 2. Read all committed, readable memory regions
 3. Search for hex key patterns
 4. Verify candidates with HMAC-SHA512 against database page 1
@@ -42,15 +43,15 @@ class MBI(ctypes.Structure):
     ]
 
 
-def get_ai_agent_pid():
+def _list_pids(image_name):
+    """返回指定进程名的 (pid, mem_K) 列表，按内存占用降序。"""
     try:
         out = subprocess.check_output(
-            'tasklist /FI "IMAGENAME eq Trae CN.exe" /FO CSV /NH',
+            f'tasklist /FI "IMAGENAME eq {image_name}" /FO CSV /NH',
             shell=True, text=True, errors='replace', timeout=5
         )
     except Exception:
-        return None
-
+        return []
     pids = []
     for line in out.strip().split('\n'):
         if not line.strip():
@@ -63,48 +64,43 @@ def get_ai_agent_pid():
                 pids.append((pid, mem))
             except Exception:
                 pass
-
-    if not pids:
-        print("[!] No Trae CN processes found")
-        return None
-
     pids.sort(key=lambda x: x[1], reverse=True)
+    return pids
 
-    for pid, mem in pids:
-        try:
-            out = subprocess.check_output(
-                f'tasklist /FI "PID eq {pid}" /M /FO CSV /NH',
-                shell=True, text=True, errors='replace', timeout=5
-            )
-            if 'ai_agent' in out.lower():
-                print(f"[+] Found ai_agent.dll in PID {pid} ({mem // 1024}MB)")
-                return pid
-        except Exception:
-            pass
 
+def _has_module(pid, keywords):
+    """检查进程是否加载了名称含关键字的模块（tasklist /M）。"""
     try:
-        import frida
-        for pid, mem in pids:
-            try:
-                s = frida.attach(pid)
-                sc = s.create_script(
-                    "rpc.exports={f:function(){var a=Process.enumerateModules().filter("
-                    "function(m){return m.name.toLowerCase().indexOf('ai_agent')!==-1;});"
-                    "return a.length>0?a[0].base.toString():null;}};"
-                )
-                sc.load()
-                r = sc.exports_sync.f()
-                s.detach()
-                if r:
-                    print(f"[+] Found ai_agent.dll in PID {pid} ({mem // 1024}MB)")
-                    return pid
-            except Exception:
-                pass
-    except ImportError:
-        pass
+        out = subprocess.check_output(
+            f'tasklist /FI "PID eq {pid}" /M /FO CSV /NH',
+            shell=True, text=True, errors='replace', timeout=5
+        )
+    except Exception:
+        return False
+    low = out.lower()
+    return any(k in low for k in keywords)
 
-    print("[!] ai_agent.dll not found in any process")
-    return None
+
+def get_candidate_pids(image_names=("Trae CN.exe",)):
+    """返回待扫描的候选 PID 列表。
+
+    新版 Trae 的进程里已找不到 ai_agent.dll，无法再按模块过滤进程；
+    这里把目标进程名的全部实例都作为候选（加载过 sqlite3.node 或
+    ai_agent 的排在前面），密钥正确与否最终由 HMAC-SHA512 校验保证。
+    """
+    merged = []
+    for name in image_names:
+        merged.extend(_list_pids(name))
+    seen, prio, rest = set(), [], []
+    for pid, mem in merged:
+        if pid in seen:
+            continue
+        seen.add(pid)
+        if _has_module(pid, ('sqlite3', 'ai_agent')):
+            prio.append(pid)
+        else:
+            rest.append(pid)
+    return prio + rest
 
 
 def read_mem(h, addr, sz):
@@ -252,51 +248,45 @@ def main():
     print(f"[+] Salt: {db_info['salt']}")
     print(f"[+] Size: {os.path.getsize(db_path) // 1024 // 1024}MB")
 
-    pid = get_ai_agent_pid()
-    if not pid:
-        print("[!] Cannot find process with ai_agent.dll")
+    candidates = get_candidate_pids(("Trae CN.exe",))
+    if not candidates:
+        print("[!] No Trae CN processes found")
+        sys.exit(1)
+    print(f"[+] {len(candidates)} candidate process(es), sqlite3.node holders first")
+
+    result = None
+    for idx, pid in enumerate(candidates, 1):
+        h = kernel32.OpenProcess(0x0010 | 0x0400, False, pid)
+        if not h:
+            print(f"[{idx}/{len(candidates)}] Cannot open process PID={pid}, skip")
+            continue
+        try:
+            regions = enum_regions(h)
+            total_mb = sum(s for _, s in regions) / 1024 / 1024
+            print(f"[{idx}/{len(candidates)}] PID={pid}: {total_mb:.0f}MB in {len(regions)} regions")
+            t0 = time.time()
+            found_keys, cands = scan_memory(h, regions, db_info, print)
+            print(f"  scan {time.time() - t0:.1f}s, verified={len(found_keys)}, candidates={len(cands)}")
+            if found_keys:
+                result = {
+                    "db_path": db_path,
+                    "salt": db_info["salt"],
+                    "enc_key": found_keys[0]["key"],
+                    "address": found_keys[0]["addr"],
+                }
+                break
+        finally:
+            kernel32.CloseHandle(h)
+
+    if not result:
+        print("\n[!] No verified key found in any process")
         sys.exit(1)
 
-    h = kernel32.OpenProcess(0x0010 | 0x0400, False, pid)
-    if not h:
-        print(f"[!] Cannot open process PID={pid}")
-        sys.exit(1)
-
-    try:
-        regions = enum_regions(h)
-        total_mb = sum(s for _, s in regions) / 1024 / 1024
-        print(f"[+] Process PID={pid}: {total_mb:.0f}MB in {len(regions)} regions")
-
-        t0 = time.time()
-        found_keys, candidates = scan_memory(h, regions, db_info, print)
-        elapsed = time.time() - t0
-
-        print(f"\n{'=' * 60}")
-        print(f"Scan complete: {elapsed:.1f}s")
-        print(f"Found: {len(found_keys)} verified keys")
-        print(f"Candidates: {len(candidates)} (HMAC failed)")
-
-        if found_keys:
-            print(f"\n[+] VERIFIED KEY: {found_keys[0]['key']}")
-            result = {
-                "db_path": db_path,
-                "salt": db_info["salt"],
-                "enc_key": found_keys[0]["key"],
-                "address": found_keys[0]["addr"]
-            }
-            out_path = os.path.join(os.getcwd(), "decrypted_key.json")
-            with open(out_path, "w") as f:
-                json.dump(result, f, indent=2)
-            print(f"[+] Key saved to {out_path}")
-        elif candidates:
-            print(f"\n[!] No verified keys found")
-            for c in candidates[:10]:
-                print(f"    {c['key']} @ {c['addr']}")
-        else:
-            print(f"\n[!] No hex patterns found in memory")
-
-    finally:
-        kernel32.CloseHandle(h)
+    print(f"\n[+] VERIFIED KEY: {result['enc_key']}")
+    out_path = os.path.join(os.getcwd(), "decrypted_key.json")
+    with open(out_path, "w") as f:
+        json.dump(result, f, indent=2)
+    print(f"[+] Key saved to {out_path}")
 
 
 if __name__ == "__main__":
